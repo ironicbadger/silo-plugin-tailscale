@@ -26,60 +26,84 @@ var version = "0.1.0"
 type plugin struct {
 	runtimedefault.Server
 	pluginv1.UnimplementedNetworkAccessProviderServer
-	mu       sync.RWMutex
-	manifest *pluginv1.PluginManifest
-	provider *tailscale.Provider
+	mu            sync.RWMutex
+	manifest      *pluginv1.PluginManifest
+	provider      *tailscale.Provider
+	host          tailscale.Host
+	configureOnce sync.Once
+	configuring   chan struct{}
 }
 
 func (p *plugin) GetManifest(context.Context, *pluginv1.GetManifestRequest) (*pluginv1.GetManifestResponse, error) {
 	return &pluginv1.GetManifestResponse{Manifest: p.manifest}, nil
 }
 func (p *plugin) Configure(ctx context.Context, req *pluginv1.ConfigureRequest) (*pluginv1.ConfigureResponse, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	config, err := tailscale.ParseConfig(req.GetConfig())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	host := sdkruntime.Host()
+	host := p.host
+	if host == nil {
+		if broker := sdkruntime.Host(); broker != nil {
+			host = broker
+		}
+	}
 	if host == nil {
 		return nil, status.Error(codes.FailedPrecondition, "host broker is not bound")
 	}
-	if p.provider != nil {
-		p.provider.Close()
-		p.provider = nil
+	p.configureOnce.Do(func() { p.configuring = make(chan struct{}, 1) })
+	select {
+	case p.configuring <- struct{}{}:
+	case <-ctx.Done():
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
+	defer func() { <-p.configuring }()
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	p.mu.Lock()
+	previous := p.provider
+	p.provider = nil
+	p.mu.Unlock()
+	if previous != nil {
+		previous.Close()
 	}
 	provider := tailscale.New(host, config, nil)
 	if err := provider.Restore(ctx); err != nil {
 		provider.Close()
 		return nil, err
 	}
+	p.mu.Lock()
 	p.provider = provider
+	p.mu.Unlock()
 	return &pluginv1.ConfigureResponse{}, nil
 }
 func (p *plugin) Connect(ctx context.Context, req *pluginv1.NetworkAccessConnectRequest) (*pluginv1.NetworkAccessStatus, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.provider == nil {
+	provider := p.currentProvider()
+	if provider == nil {
 		return nil, status.Error(codes.FailedPrecondition, "plugin is not configured")
 	}
-	return p.provider.Connect(ctx, req)
+	return provider.Connect(ctx, req)
 }
 func (p *plugin) Disconnect(ctx context.Context, req *pluginv1.NetworkAccessDisconnectRequest) (*pluginv1.NetworkAccessStatus, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.provider == nil {
+	provider := p.currentProvider()
+	if provider == nil {
 		return nil, status.Error(codes.FailedPrecondition, "plugin is not configured")
 	}
-	return p.provider.Disconnect(ctx, req)
+	return provider.Disconnect(ctx, req)
 }
 func (p *plugin) GetStatus(ctx context.Context, req *pluginv1.NetworkAccessGetStatusRequest) (*pluginv1.NetworkAccessStatus, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.provider == nil {
+	provider := p.currentProvider()
+	if provider == nil {
 		return nil, status.Error(codes.FailedPrecondition, "plugin is not configured")
 	}
-	return p.provider.GetStatus(ctx, req)
+	return provider.GetStatus(ctx, req)
+}
+
+func (p *plugin) currentProvider() *tailscale.Provider {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.provider
 }
 func main() {
 	// Enrollment is controlled only by the encrypted Silo configuration.

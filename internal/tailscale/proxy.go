@@ -98,6 +98,7 @@ type serving struct {
 	server      *http.Server
 	transport   *http.Transport
 	connections *connections
+	done        <-chan struct{}
 }
 
 func serve(ctx context.Context, listener net.Listener, tlsConfig *tls.Config, address, token string, failures chan<- error) serving {
@@ -110,7 +111,9 @@ func serve(ctx context.Context, listener net.Listener, tlsConfig *tls.Config, ad
 	server := &http.Server{Handler: proxy, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second,
 		ErrorLog:    log.New(io.Discard, "", 0),
 		BaseContext: func(net.Listener) context.Context { return ctx }}
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		err := server.Serve(listener)
 		if !errors.Is(err, http.ErrServerClosed) {
 			select {
@@ -119,10 +122,13 @@ func serve(ctx context.Context, listener net.Listener, tlsConfig *tls.Config, ad
 			}
 		}
 	}()
-	return serving{server, transport, connections}
+	return serving{server: server, transport: transport, connections: connections, done: done}
 }
 func (s serving) close() {
 	_ = s.server.Close()
+	// Close may run before Serve registers the listener. Wait for Serve's
+	// deferred listener close before allowing this port to be opened again.
+	<-s.done
 	s.connections.close()
 	s.transport.CloseIdleConnections()
 }

@@ -9,6 +9,8 @@ import (
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/runtimehost"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"tailscale.com/ipn"
 )
 
@@ -43,9 +45,13 @@ func (h *memoryHost) WriteInstanceState(_ context.Context, key string, b []byte)
 	h.values[key] = append([]byte{}, b...)
 	return nil
 }
-func (h *memoryHost) ReportNetworkAccessStatus(_ context.Context, s *pluginv1.NetworkAccessStatus) error {
-	h.reports <- s
-	return nil
+func (h *memoryHost) ReportNetworkAccessStatus(ctx context.Context, s *pluginv1.NetworkAccessStatus) error {
+	select {
+	case h.reports <- s:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 func waitState(t *testing.T, h *memoryHost, state string) *pluginv1.NetworkAccessStatus {
 	t.Helper()
@@ -183,6 +189,250 @@ func TestUnknownErrorsDoNotExposeSecrets(t *testing.T) {
 	}
 }
 
+func TestRestoreIsIdempotent(t *testing.T) {
+	h := newHost()
+	h.values[desiredKey] = []byte("1")
+	started := make(chan context.Context, 2)
+	p := New(h, Config{}, func(ctx context.Context, _ Host, _ Config, _ func(*pluginv1.NetworkAccessStatus)) error {
+		started <- ctx
+		select {
+		case <-ctx.Done():
+		case <-t.Context().Done():
+		}
+		return ctx.Err()
+	})
+	defer p.Close()
+	if err := p.Restore(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	first := <-started
+	if err := p.Restore(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	p.Close()
+	if first.Err() == nil {
+		t.Fatal("restoring twice abandoned the original runner")
+	}
+	select {
+	case <-started:
+		t.Fatal("restoring twice started another runner")
+	default:
+	}
+}
+
+func TestCloseIsTerminalAndIdempotent(t *testing.T) {
+	h := newHost()
+	p := New(h, Config{}, func(ctx context.Context, _ Host, _ Config, _ func(*pluginv1.NetworkAccessStatus)) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	defer p.Close()
+	if _, err := p.Connect(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	p.Close()
+	p.Close()
+	for name, operation := range map[string]func() error{
+		"restore":    func() error { return p.Restore(t.Context()) },
+		"connect":    func() error { _, err := p.Connect(t.Context(), nil); return err },
+		"disconnect": func() error { _, err := p.Disconnect(t.Context(), nil); return err },
+		"status":     func() error { _, err := p.GetStatus(t.Context(), nil); return err },
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := operation(); status.Code(err) != codes.FailedPrecondition {
+				t.Fatalf("closed provider accepted operation: %v", err)
+			}
+		})
+	}
+	if b, _, _ := h.ReadInstanceState(t.Context(), desiredKey); string(b) != "1" {
+		t.Fatal("operation after Close changed saved intent")
+	}
+}
+
+func TestGetStatusRejectsRetiredProviderDuringShutdown(t *testing.T) {
+	h := newHost()
+	stopping := make(chan struct{})
+	release := make(chan struct{})
+	p := New(h, Config{}, func(ctx context.Context, _ Host, _ Config, publish func(*pluginv1.NetworkAccessStatus)) error {
+		publish(&pluginv1.NetworkAccessStatus{State: "connected", Origin: "https://silo.example.test"})
+		<-ctx.Done()
+		close(stopping)
+		<-release
+		return ctx.Err()
+	})
+	defer p.Close()
+	defer close(release)
+	if _, err := p.Connect(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, h, "connected")
+	go p.Close()
+	<-stopping
+	result := make(chan error, 1)
+	go func() {
+		s, err := p.GetStatus(t.Context(), nil)
+		if s != nil {
+			result <- errors.New("retired provider exposed stale status")
+			return
+		}
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("retired provider returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("GetStatus blocked behind provider shutdown")
+	}
+}
+
+type blockedWriteHost struct {
+	*memoryHost
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (h *blockedWriteHost) WriteInstanceState(ctx context.Context, key string, value []byte) error {
+	h.once.Do(func() { close(h.entered) })
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-h.release:
+		return h.memoryHost.WriteInstanceState(ctx, key, value)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestLifecycleWaitHonorsCancellation(t *testing.T) {
+	h := &blockedWriteHost{memoryHost: newHost(), entered: make(chan struct{}), release: make(chan struct{})}
+	p := New(h, Config{}, func(ctx context.Context, _ Host, _ Config, _ func(*pluginv1.NetworkAccessStatus)) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	defer p.Close()
+	var release sync.Once
+	defer release.Do(func() { close(h.release) })
+	connected := make(chan error, 1)
+	go func() { _, err := p.Connect(t.Context(), nil); connected <- err }()
+	<-h.entered
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	for name, operation := range map[string]func() error{
+		"restore":    func() error { return p.Restore(ctx) },
+		"connect":    func() error { _, err := p.Connect(ctx, nil); return err },
+		"disconnect": func() error { _, err := p.Disconnect(ctx, nil); return err },
+	} {
+		t.Run(name, func(t *testing.T) {
+			result := make(chan error, 1)
+			go func() { result <- operation() }()
+			select {
+			case err := <-result:
+				if status.Code(err) != codes.Canceled {
+					t.Fatalf("canceled operation returned %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				release.Do(func() { close(h.release) })
+				t.Fatal("canceled operation remained queued behind state persistence")
+			}
+		})
+	}
+	release.Do(func() { close(h.release) })
+	if err := <-connected; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCanceledStateWriteDoesNotStartRunner(t *testing.T) {
+	h := &blockedWriteHost{memoryHost: newHost(), entered: make(chan struct{}), release: make(chan struct{})}
+	started := make(chan struct{}, 1)
+	p := New(h, Config{}, func(context.Context, Host, Config, func(*pluginv1.NetworkAccessStatus)) error {
+		started <- struct{}{}
+		return nil
+	})
+	defer p.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { _, err := p.Connect(ctx, nil); result <- err }()
+	<-h.entered
+	cancel()
+	if err := <-result; status.Code(err) != codes.Canceled {
+		t.Fatalf("canceled state write returned %v", err)
+	}
+	p.Close()
+	select {
+	case <-started:
+		t.Fatal("canceled state write started the runner")
+	default:
+	}
+}
+
+func TestConnectRetriesActiveErrorRun(t *testing.T) {
+	h := newHost()
+	started := make(chan context.Context, 2)
+	p := New(h, Config{}, func(ctx context.Context, _ Host, _ Config, publish func(*pluginv1.NetworkAccessStatus)) error {
+		started <- ctx
+		publish(&pluginv1.NetworkAccessStatus{State: "error", Error: "enrollment failed"})
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	defer p.Close()
+	if _, err := p.Connect(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	first := <-started
+	waitState(t, h, "error")
+	if _, err := p.Connect(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case second := <-started:
+		if first.Err() == nil || second.Err() != nil {
+			t.Fatal("retry did not retire the failed runner before starting its replacement")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Connect did not retry an active runner in the error state")
+	}
+}
+
+type blockedReportHost struct {
+	*memoryHost
+	entered  chan struct{}
+	canceled chan struct{}
+	release  chan struct{}
+}
+
+func (h *blockedReportHost) ReportNetworkAccessStatus(ctx context.Context, _ *pluginv1.NetworkAccessStatus) error {
+	close(h.entered)
+	<-ctx.Done()
+	close(h.canceled)
+	<-h.release
+	return ctx.Err()
+}
+
+func TestCloseWaitsForStatusReporter(t *testing.T) {
+	h := &blockedReportHost{memoryHost: newHost(), entered: make(chan struct{}), canceled: make(chan struct{}), release: make(chan struct{})}
+	p := New(h, Config{}, nil)
+	defer p.Close()
+	defer close(h.release)
+	if err := p.Restore(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	<-h.entered
+	closed := make(chan struct{})
+	go func() { p.Close(); close(closed) }()
+	<-h.canceled
+	select {
+	case <-closed:
+		t.Fatal("Close returned with an active status report")
+	default:
+	}
+}
+
 func TestStoreRoundTripAndIsolation(t *testing.T) {
 	a, b := StateStore{newHost()}, StateStore{newHost()}
 	if _, err := a.ReadState("missing"); !errors.Is(err, ipn.ErrStateNotExist) {
@@ -200,7 +450,7 @@ func TestStoreRoundTripAndIsolation(t *testing.T) {
 			t.Fatal("cross-instance state leak")
 		}
 	}
-	if err := a.WriteState("empty", nil); err != nil {
+	if err := a.WriteState("empty", []byte{}); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := a.ReadState("empty"); err != nil || len(got) != 0 {

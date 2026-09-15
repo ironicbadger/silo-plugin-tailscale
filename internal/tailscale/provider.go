@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
@@ -29,16 +30,19 @@ type Runner func(context.Context, Host, Config, func(*pluginv1.NetworkAccessStat
 
 type Provider struct {
 	pluginv1.UnimplementedNetworkAccessProviderServer
-	host   Host
-	config Config
-	run    Runner
-	life   sync.Mutex
-	mu     sync.Mutex
-	status *pluginv1.NetworkAccessStatus
-	cancel context.CancelFunc
-	done   chan struct{}
-	wake   chan struct{}
-	stop   context.CancelFunc
+	host     Host
+	config   Config
+	run      Runner
+	life     chan struct{}
+	mu       sync.Mutex
+	status   *pluginv1.NetworkAccessStatus
+	cancel   context.CancelFunc
+	done     chan struct{}
+	wake     chan struct{}
+	stop     context.CancelFunc
+	reported chan struct{}
+	restored bool
+	closed   atomic.Bool
 }
 
 func New(host Host, config Config, run Runner) *Provider {
@@ -48,25 +52,36 @@ func New(host Host, config Config, run Runner) *Provider {
 	done := make(chan struct{})
 	close(done)
 	ctx, stop := context.WithCancel(context.Background())
-	p := &Provider{host: host, config: config, run: run, done: done, wake: make(chan struct{}, 1), stop: stop,
+	p := &Provider{host: host, config: config, run: run, life: make(chan struct{}, 1), done: done,
+		wake: make(chan struct{}, 1), stop: stop, reported: make(chan struct{}),
 		status: &pluginv1.NetworkAccessStatus{State: "disconnected", ProviderVersion: ProviderVersion}}
-	go p.report(ctx)
+	go func() {
+		defer close(p.reported)
+		p.report(ctx)
+	}()
 	return p
 }
 
 // Restore is called during Configure, after the host broker is bound. It never
 // waits for enrollment and does not need a subsequent admin RPC to reconnect.
+// Repeated calls do not start another runner or replace later operator intent.
 func (p *Provider) Restore(ctx context.Context) error {
-	p.life.Lock()
-	defer p.life.Unlock()
+	if err := p.acquire(ctx); err != nil {
+		return err
+	}
+	defer p.release()
+	if p.restored {
+		return nil
+	}
 	b, found, err := p.host.ReadInstanceState(ctx, desiredKey)
 	if err != nil {
-		return status.Error(codes.Unavailable, "cannot read connection intent")
+		return stateError(ctx, "cannot read connection intent")
 	}
 	if found && string(b) != "0" && string(b) != "1" {
 		return status.Error(codes.FailedPrecondition, "invalid saved connection intent")
 	}
-	if string(b) == "1" {
+	p.restored = true
+	if found && string(b) == "1" {
 		p.start()
 	} else {
 		p.signal()
@@ -75,15 +90,24 @@ func (p *Provider) Restore(ctx context.Context) error {
 }
 
 func (p *Provider) Connect(ctx context.Context, _ *pluginv1.NetworkAccessConnectRequest) (*pluginv1.NetworkAccessStatus, error) {
-	p.life.Lock()
-	defer p.life.Unlock()
+	if err := p.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer p.release()
 	if p.cancel != nil {
 		select {
 		case <-p.done:
 			p.cancel()
 			p.cancel = nil
 		default:
-			return p.snapshot(), nil
+			current := p.snapshot()
+			if current.State != "error" {
+				return current, nil
+			}
+			// The overlay may keep retrying after an asynchronous failure.
+			// An explicit retry must retire that run before starting another.
+			p.cancel()
+			p.cancel = nil
 		}
 	}
 	select {
@@ -92,8 +116,9 @@ func (p *Provider) Connect(ctx context.Context, _ *pluginv1.NetworkAccessConnect
 		return nil, status.FromContextError(ctx.Err()).Err()
 	}
 	if err := p.host.WriteInstanceState(ctx, desiredKey, []byte("1")); err != nil {
-		return nil, status.Error(codes.Unavailable, "cannot save connection intent")
+		return nil, stateError(ctx, "cannot save connection intent")
 	}
+	p.restored = true
 	p.start()
 	return p.snapshot(), nil
 }
@@ -128,11 +153,14 @@ func (p *Provider) start() {
 }
 
 func (p *Provider) Disconnect(ctx context.Context, _ *pluginv1.NetworkAccessDisconnectRequest) (*pluginv1.NetworkAccessStatus, error) {
-	p.life.Lock()
-	defer p.life.Unlock()
-	if err := p.host.WriteInstanceState(ctx, desiredKey, []byte("0")); err != nil {
-		return nil, status.Error(codes.Unavailable, "cannot save connection intent")
+	if err := p.acquire(ctx); err != nil {
+		return nil, err
 	}
+	defer p.release()
+	if err := p.host.WriteInstanceState(ctx, desiredKey, []byte("0")); err != nil {
+		return nil, stateError(ctx, "cannot save connection intent")
+	}
+	p.restored = true
 	if p.cancel != nil {
 		p.cancel()
 		p.cancel = nil
@@ -147,19 +175,60 @@ func (p *Provider) Disconnect(ctx context.Context, _ *pluginv1.NetworkAccessDisc
 }
 
 func (p *Provider) GetStatus(context.Context, *pluginv1.NetworkAccessGetStatusRequest) (*pluginv1.NetworkAccessStatus, error) {
-	return p.snapshot(), nil
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed.Load() {
+		return nil, status.Error(codes.FailedPrecondition, "provider is closed")
+	}
+	return proto.Clone(p.status).(*pluginv1.NetworkAccessStatus), nil
 }
 
 // Close stops the process without changing the persisted operator intent.
+// It waits for the runner and status reporter, and permanently closes the provider.
 func (p *Provider) Close() {
-	p.life.Lock()
-	defer p.life.Unlock()
+	p.life <- struct{}{}
+	defer p.release()
+	if p.closed.Load() {
+		return
+	}
+	p.closed.Store(true)
 	p.stop()
 	if p.cancel != nil {
 		p.cancel()
 		p.cancel = nil
 	}
 	<-p.done
+	<-p.reported
+}
+
+// acquire serializes lifecycle changes without keeping canceled RPCs queued
+// behind network shutdown or an unavailable state store. Runner state and
+// restored are protected by this gate. Atomic closure lets status calls reject
+// retired providers without waiting for their lifecycle operations to finish.
+func (p *Provider) acquire(ctx context.Context) error {
+	select {
+	case p.life <- struct{}{}:
+	case <-ctx.Done():
+		return status.FromContextError(ctx.Err()).Err()
+	}
+	if err := ctx.Err(); err != nil {
+		p.release()
+		return status.FromContextError(err).Err()
+	}
+	if p.closed.Load() {
+		p.release()
+		return status.Error(codes.FailedPrecondition, "provider is closed")
+	}
+	return nil
+}
+
+func (p *Provider) release() { <-p.life }
+
+func stateError(ctx context.Context, message string) error {
+	if err := ctx.Err(); err != nil {
+		return status.FromContextError(err).Err()
+	}
+	return status.Error(codes.Unavailable, message)
 }
 
 func (p *Provider) snapshot() *pluginv1.NetworkAccessStatus {
@@ -201,6 +270,9 @@ func (p *Provider) report(ctx context.Context) {
 			return
 		case <-p.wake:
 		case <-ticker.C:
+		}
+		if ctx.Err() != nil {
+			return
 		}
 		call, cancel := context.WithTimeout(ctx, 3*time.Second)
 		err := p.host.ReportNetworkAccessStatus(call, p.snapshot())

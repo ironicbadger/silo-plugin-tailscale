@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
@@ -62,9 +65,15 @@ func (h *testHost) GetHostInfo(context.Context, *pluginv1.GetHostInfoRequest) (*
 
 func TestProcessBrokerAndAutomaticReconnect(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "plugin")
-	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+	if out, err := exec.Command("go", "build", "-ldflags=-X main.version=0.0.0-contract-test", "-o", bin, ".").CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
+	binary, err := os.ReadFile(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(binary)
+	expectedChecksum := hex.EncodeToString(digest[:])
 	h := &testHost{values: map[string][]byte{"desired_connected": []byte("1")}, requests: make(chan struct{}, 4)}
 	start := func() *sdkruntime.Client {
 		client := goplugin.NewClient(&goplugin.ClientConfig{
@@ -94,7 +103,7 @@ func TestProcessBrokerAndAutomaticReconnect(t *testing.T) {
 			t.Fatal(err)
 		}
 		m, err := rt.Runtime().GetManifest(ctx, &pluginv1.GetManifestRequest{})
-		if err != nil || len(m.GetManifest().GetChecksum()) != 64 {
+		if err != nil || m.GetManifest().GetChecksum() != expectedChecksum || m.GetManifest().GetVersion() != "0.0.0-contract-test" {
 			t.Fatalf("manifest: %v %v", m, err)
 		}
 		if _, err := rt.Runtime().Configure(ctx, &pluginv1.ConfigureRequest{}); err != nil {

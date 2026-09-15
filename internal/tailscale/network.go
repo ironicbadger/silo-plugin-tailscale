@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/netip"
 	"slices"
 	"strings"
@@ -11,6 +12,9 @@ import (
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/runtimehost"
+	"tailscale.com/client/local"
+	"tailscale.com/health"
+	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 )
@@ -79,7 +83,55 @@ func connectedStatus(info *runtimehost.HostInfo, st *ipnstate.Status) (*pluginv1
 	return s, nil
 }
 
+// overlay exposes the narrow tsnet surface used by the connection lifecycle.
+// Keeping transport construction here permits deterministic failure-path tests.
+type overlay interface {
+	Start() error
+	Close() error
+	Status(context.Context) (*ipnstate.Status, error)
+	CertPair(context.Context, string) ([]byte, []byte, error)
+	Listen(string, string) (net.Listener, error)
+	Watch(context.Context) (notificationWatcher, error)
+}
+
+type notificationWatcher interface {
+	Next() (ipn.Notify, error)
+	Close() error
+}
+
+type tsnetOverlay struct {
+	*tsnet.Server
+	client *local.Client
+}
+
+func (s *tsnetOverlay) Start() error {
+	if err := s.Server.Start(); err != nil {
+		return err
+	}
+	var err error
+	s.client, err = s.LocalClient()
+	return err
+}
+func (s *tsnetOverlay) Status(ctx context.Context) (*ipnstate.Status, error) {
+	return s.client.StatusWithoutPeers(ctx)
+}
+func (s *tsnetOverlay) CertPair(ctx context.Context, hostname string) ([]byte, []byte, error) {
+	return s.client.CertPair(ctx, hostname)
+}
+func (s *tsnetOverlay) Watch(ctx context.Context) (notificationWatcher, error) {
+	return s.client.WatchIPNBus(ctx, ipn.NotifyInitialState|ipn.NotifyInitialHealthState|ipn.NotifyNoPrivateKeys)
+}
+
 func Run(ctx context.Context, host Host, config Config, publish func(*pluginv1.NetworkAccessStatus)) error {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	return runOverlay(ctx, host, publish, func(info *runtimehost.HostInfo) overlay {
+		return &tsnetOverlay{Server: &tsnet.Server{Hostname: Hostname(config, info), Store: StateStore{host}, NoLocalState: true,
+			AuthKey: config.AuthKey, UserLogf: func(string, ...any) {}, Logf: func(string, ...any) {}}}
+	}, ticker.C)
+}
+
+func runOverlay(ctx context.Context, host Host, publish func(*pluginv1.NetworkAccessStatus), newOverlay func(*runtimehost.HostInfo) overlay, ticks <-chan time.Time) error {
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
 	call, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -91,8 +143,7 @@ func Run(ctx context.Context, host Host, config Config, publish func(*pluginv1.N
 	if err := validateHost(info); err != nil {
 		return err
 	}
-	srv := &tsnet.Server{Hostname: Hostname(config, info), Store: StateStore{host}, NoLocalState: true,
-		AuthKey: config.AuthKey, UserLogf: func(string, ...any) {}, Logf: func(string, ...any) {}}
+	srv := newOverlay(info)
 	if err := srv.Start(); err != nil {
 		return &PublicError{"cannot start tsnet; check encrypted state storage and retry"}
 	}
@@ -101,12 +152,30 @@ func Run(ctx context.Context, host Host, config Config, publish func(*pluginv1.N
 	closed := make(chan struct{})
 	go func() { <-ctx.Done(); _ = srv.Close(); close(closed) }()
 	defer func() { stop(); <-closed }()
-	lc, err := srv.LocalClient()
+	watcher, err := srv.Watch(ctx)
 	if err != nil {
-		return &PublicError{"cannot open tsnet control client"}
+		return &PublicError{"cannot monitor tsnet; reconnect to retry"}
 	}
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+	watchDone := make(chan struct{})
+	changes := make(chan ipn.Notify)
+	watchErrors := make(chan error, 1)
+	go func() {
+		defer close(watchDone)
+		for {
+			notification, err := watcher.Next()
+			if err != nil {
+				watchErrors <- err
+				return
+			}
+			select {
+			case changes <- notification:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	defer func() { stop(); _ = watcher.Close(); <-watchDone }()
+	loginError := false
 	failures := make(chan error, len(info.Listeners))
 	var servers []serving
 	closeServers := func() {
@@ -119,7 +188,7 @@ func Run(ctx context.Context, host Host, config Config, publish func(*pluginv1.N
 	lastHostname := ""
 	for {
 		call, cancel := context.WithTimeout(ctx, 5*time.Second)
-		st, err := lc.StatusWithoutPeers(call)
+		st, err := srv.Status(call)
 		cancel()
 		if err != nil {
 			if ctx.Err() != nil {
@@ -130,14 +199,18 @@ func Run(ctx context.Context, host Host, config Config, publish func(*pluginv1.N
 		if st.BackendState != "Running" || len(st.TailscaleIPs) == 0 {
 			closeServers()
 			s := &pluginv1.NetworkAccessStatus{State: "connecting"}
+			if loginError {
+				s.State, s.Error = "error", "Tailscale enrollment failed; check the auth key and network connectivity"
+			}
 			if st.AuthURL != "" {
-				s.State, s.AuthUrl = "awaiting_authorization", st.AuthURL
+				s.State, s.AuthUrl, s.Error = "awaiting_authorization", st.AuthURL, ""
 			}
 			if st.BackendState == "NeedsMachineAuth" {
-				s.State = "awaiting_authorization"
+				s.State, s.Error = "awaiting_authorization", ""
 			}
 			publish(s)
 		} else {
+			loginError = false
 			s, err := connectedStatus(info, st)
 			if err != nil {
 				return err
@@ -150,7 +223,7 @@ func Run(ctx context.Context, host Host, config Config, publish func(*pluginv1.N
 				// issuance and listener setup are still in progress.
 				publish(&pluginv1.NetworkAccessStatus{State: "connecting", Hostname: s.Hostname, Addresses: s.Addresses})
 				call, cancel := context.WithTimeout(ctx, 2*time.Minute)
-				_, _, err := lc.CertPair(call, s.Hostname)
+				_, _, err := srv.CertPair(call, s.Hostname)
 				cancel()
 				if err != nil {
 					return &PublicError{"cannot obtain HTTPS certificate; check tailnet HTTPS settings and reconnect"}
@@ -160,7 +233,7 @@ func Run(ctx context.Context, host Host, config Config, publish func(*pluginv1.N
 					if err != nil {
 						return &PublicError{"cannot open all overlay listeners; reconnect to retry"}
 					}
-					tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: lc.GetCertificate}
+					tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: certificateFor(ctx, srv, s.Hostname)}
 					servers = append(servers, serve(ctx, ln, tlsConfig, l.Address, info.IngressToken, failures))
 				}
 				lastHostname = s.Hostname
@@ -172,7 +245,41 @@ func Run(ctx context.Context, host Host, config Config, publish func(*pluginv1.N
 			return ctx.Err()
 		case <-failures:
 			return &PublicError{"overlay listener stopped; reconnect to retry"}
-		case <-ticker.C:
+		case notification := <-changes:
+			if notification.ErrMessage != nil {
+				loginError = true
+			}
+			if notification.Health != nil {
+				warning := notification.Health.Warnings[health.LoginStateWarnable.Code]
+				loginError = warning.Args[health.ArgError] != ""
+			}
+		case <-watchErrors:
+			return &PublicError{"tsnet status monitoring stopped; reconnect to retry"}
+		case <-ticks:
 		}
+	}
+}
+
+// certificateFor restricts issuance to this node and cancels certificate work
+// with either the TLS handshake or the provider. The upstream GetCertificate
+// helper starts from Background, allowing work to outlive a closed connection.
+func certificateFor(ctx context.Context, node overlay, hostname string) func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		if hello == nil || !strings.EqualFold(strings.TrimSuffix(hello.ServerName, "."), hostname) {
+			return nil, &PublicError{"unexpected TLS server name"}
+		}
+		call, cancel := context.WithTimeout(hello.Context(), 10*time.Second)
+		stop := context.AfterFunc(ctx, cancel)
+		defer stop()
+		defer cancel()
+		certPEM, keyPEM, err := node.CertPair(call, hostname)
+		if err != nil {
+			return nil, &PublicError{"HTTPS certificate unavailable"}
+		}
+		certificate, err := tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			return nil, &PublicError{"invalid HTTPS certificate"}
+		}
+		return &certificate, nil
 	}
 }
