@@ -1,0 +1,33 @@
+package acme
+
+import (
+	"os"
+	"testing"
+
+	"tailscale.com/ipn/ipnlocal/ipnlocaltest"
+	"tailscale.com/ipn/store/mem"
+	"tailscale.com/tsd"
+	"tailscale.com/util/eventbus/eventbustest"
+)
+
+// This regression runs inside the adapted upstream package so it can verify
+// the private certificate-store selection without contacting an ACME server.
+type siloTestStore struct { mem.Store }
+
+func TestSiloCustomStateStoreKeepsCertificatesOffDisk(t *testing.T) {
+	store := &siloTestStore{}
+	sys := tsd.NewSystemWithBus(eventbustest.NewBus(t))
+	sys.Set(store)
+	b := ipnlocaltest.NewBackendWithSys(t, sys)
+	dir := t.TempDir()
+	b.SetVarRoot(dir)
+	cs, err := extOf(t, b).getCertStore(b)
+	if err != nil { t.Fatal(err) }
+	if _, ok := cs.(certStateStore); !ok { t.Fatalf("certificate store is %T, want host state", cs) }
+	if err := cs.WriteACMEKey([]byte("account-key")); err != nil { t.Fatal(err) }
+	if err := cs.WriteTLSCertAndKey("silo.example.test", []byte("certificate"), []byte("tls-key")); err != nil { t.Fatal(err) }
+	if key, err := cs.ACMEKey(); err != nil || string(key) != "account-key" { t.Fatal("ACME key not persisted") }
+	if key, err := store.ReadState("silo.example.test.key"); err != nil || string(key) != "tls-key" { t.Fatal("TLS key not persisted") }
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 { t.Fatalf("certificate files written: %v %v", entries, err) }
+}

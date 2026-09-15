@@ -1,0 +1,126 @@
+# Tailscale for Silo
+
+A resident Silo plugin that runs an embedded Tailscale node and exposes Silo's
+listeners over private tailnet HTTPS. Existing Silo authentication still applies.
+No separate Tailscale daemon, TUN device, privileged container, or public port
+forwarding is required.
+
+Built against [SDK v0.16.1](https://github.com/Silo-Server/silo-plugin-sdk/releases/tag/v0.16.1)
+and the server's [network-access branch, PR #1096](https://github.com/Silo-Server/silo-server/pull/1096),
+following [issue #1001](https://github.com/Silo-Server/silo-server/issues/1001#issuecomment-5641730352).
+The server PR is still a prerequisite until merged and released.
+
+## Build and verify
+
+Requires Go 1.26.7 or later, Python 3, and Make. Run from this repository:
+
+```sh
+make check
+make build
+make dist VERSION=0.1.0
+```
+
+`plugin` is the local executable. `dist/` contains Linux amd64, Linux arm64,
+and macOS arm64 archives. Each ZIP archive contains `plugin`, a manifest carrying
+the executable's SHA-256 checksum, and licenses. The embedded manifest also
+computes its checksum at runtime. CI verifies and packages each change without
+publishing a release.
+
+**Use Make rather than plain `go build`.** The pinned Tailscale dependency needs
+the storage adaptations described below. An unadapted build fails on the missing
+`NoLocalState` field instead of silently writing private state to disk.
+
+## Configure
+
+1. Run Silo with the network-access server support. Check
+   `GET /api/v2/network-access/capabilities`. This version supports one API host
+   plus proxy nodes; transcode nodes do not run this plugin. The server currently
+   requires the API host and proxies to share an OS and architecture.
+2. Enable MagicDNS and HTTPS certificates in your Tailscale admin console.
+   Certificate issuance puts the tailnet DNS name in public certificate
+   transparency logs. Use non-sensitive hostnames.
+3. Extract the matching ZIP and upload its `plugin` executable through Silo's plugin installation flow. Then
+   enable the installation. Choose a hostname prefix; the default yields
+   `silo-api` and `silo-proxy-<node id>`. Use distinct prefixes for separate
+   deployments. Tailscale may disambiguate existing names; status reports the
+   actual assigned DNS name.
+4. Optionally save a Tailscale auth key in the plugin's password field. For
+   multiple hosts use a reusable key, with tags/preapproval configured according
+   to your tailnet policy. Leave it empty for interactive enrollment. The key is
+   only used when a node needs enrollment; replacing it does not replace an
+   existing identity.
+5. Select **Connect** in Settings > Network Access. Each host reports its own
+   authorization URL when a login is needed. Approve the device in Tailscale if
+   your policy requires it. Enrollment continues after the API request returns.
+6. Use the reported HTTPS origin in a Silo client on a tailnet-connected device.
+   Allow the relevant ports through your tailnet access policy: API 443,
+   Jellyfin 8096, Audiobookshelf 13378 by default. All exposed listeners use TLS.
+
+The API listener is always exposed. Enabled Jellyfin and Audiobookshelf listeners
+are exposed on the API host; proxies expose only their API listener. Host-provided
+port overrides are honored. Every listener must bind successfully before status
+becomes `connected`. The server handles per-access-path stream URL selection.
+
+**Disconnect** closes listeners, streams, and WebSocket tunnels and saves the
+disconnected intent. It retains node identity. A process restart reconnects only
+when the last saved intent was connected. A non-running Tailscale backend
+clears exposed origins until it becomes ready again. For a terminal provider error,
+fix the reported cause and select Connect to retry. Failed state writes return an
+error and do not pretend the new intent was saved.
+
+## Security and state
+
+- Node keys, profiles, TLS private keys, ACME account state and connection intent
+  use the host's encrypted per-instance store. Nothing is persisted by the plugin
+  to local state files. The host separates the API and proxy state scopes.
+- Each run reads fresh host metadata and its ingress token. The token remains in
+  memory. Requests preserve Host and replace forwarding metadata with the actual
+  overlay peer, HTTPS scheme, and host token. Targets must be loopback IPs.
+- HTTP range requests, streaming responses, and WebSocket upgrades use Go's
+  standard reverse proxy. There is no write timeout on long playback responses.
+- Authorization URLs appear only in `awaiting_authorization` status. Provider
+  logs contain fixed messages and state names; upstream errors, URLs, tokens and
+  keys are excluded. Tailscale log uploads and local logtail buffers are disabled.
+- Funnel, identity-based Silo login, arbitrary upstream URLs, multiple API
+  replicas, and non-Tailscale providers are outside this plugin's scope.
+
+## Tailscale storage adaptations
+
+Tailscale is pinned to **v1.102.4**. Its public `Store` field does not fully satisfy
+Silo's no-files contract: tsnet creates logtail files, and ACME uses a certificate
+directory for custom stores outside Kubernetes.
+
+`scripts/prepare_tailscale.py` copies the verified Go module into ignored build
+storage and applies exact-match edits to two source files:
+
+1. Add `tsnet.Server.NoLocalState`, require an external store, and skip the local
+   state directory and logtail setup when enabled.
+2. Route certificate and ACME state through any custom state store, rather than
+   restricting that behavior to Kubernetes.
+
+The module cache and committed go.mod stay unchanged. An alternate build modfile
+points only Tailscale at the adapted source. The preparation script checks the
+exact version and fails if patch context changes. The Go module retains upstream
+licenses in the copied source. Revisit these adaptations on every dependency
+update; replace them with upstream APIs when equivalent controls become available.
+This is a deliberate maintenance cost, not an unmodified upstream tsnet build.
+
+## Validation scope
+
+`make check` runs race-enabled lifecycle, configuration, state, proxy and gRPC
+process tests; a real tsnet node against local test control/DERP/STUN servers;
+and an ACME storage regression inside the adapted upstream package. The tests
+need no real tailnet credentials. `make dist` cross-compiles all listed platforms.
+
+Before release, validate on the server branch with a real tailnet:
+
+- Interactive and reusable-key enrollment, device approval, TLS issuance/renewal.
+- Host/plugin restart with identity retention and disconnected-intent retention.
+- Silo sign-in, playback, seeking, events, and WebSockets over the reported origin.
+- Jellyfin and Audiobookshelf login, playback, and progress updates.
+- API plus proxy nodes: distinct identities and tailnet stream URLs, with fallback
+  when a proxy disconnects. Disconnect during active playback and WebSockets.
+
+Real-tailnet/server playback QA has not been performed by the automated tests.
+No Apple or Android API changes are needed: clients install Tailscale separately
+and use the provider's reported server URL.

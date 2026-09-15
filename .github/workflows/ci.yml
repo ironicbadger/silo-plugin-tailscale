@@ -1,0 +1,22 @@
+name: Verify and package
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: make check
+      - run: make dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-plugin
+          path: |
+            dist/*.zip
+            dist/checksums.txt
