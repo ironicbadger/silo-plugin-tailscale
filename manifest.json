@@ -1,6 +1,6 @@
 {
   "plugin_id": "ironicbadger.network-access.tailscale",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "presentation": {
@@ -12,24 +12,67 @@
     "license_spdx": "MIT"
   },
   "supported_platforms": [
-    {"os": "linux", "arch": "amd64"},
-    {"os": "linux", "arch": "arm64"},
-    {"os": "darwin", "arch": "arm64"}
+    {
+      "os": "linux",
+      "arch": "amd64"
+    },
+    {
+      "os": "linux",
+      "arch": "arm64"
+    },
+    {
+      "os": "darwin",
+      "arch": "arm64"
+    }
   ],
-  "capabilities": [{
-    "type": "network_access_provider.v1",
-    "id": "tailscale",
-    "display_name": "Tailscale",
-    "network_access_provider": {"provider": "tailscale", "display_name": "Tailscale"}
-  }],
-  "global_config_schema": [{
-    "key": "tailscale",
-    "title": "Tailscale",
-    "description": "Enrollment settings shared by all hosts. Each host retains its own node identity.",
-    "json_schema": "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"hostname_prefix\":{\"type\":\"string\",\"pattern\":\"^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$\",\"default\":\"silo\"},\"auth_key\":{\"type\":\"string\",\"writeOnly\":true}}}",
-    "admin_form": {"fields": [
-      {"key": "hostname_prefix", "label": "Hostname prefix", "control": "ADMIN_FORM_CONTROL_TEXT", "default_value": "silo", "description": "Produces <prefix>-api and <prefix>-proxy-<node id>. Use a different prefix for each Silo deployment."},
-      {"key": "auth_key", "label": "Auth key", "control": "ADMIN_FORM_CONTROL_PASSWORD", "secret": true, "description": "Optional Tailscale auth key. Use a reusable key for multiple hosts; leave empty for interactive enrollment."}
-    ]}
-  }]
+  "capabilities": [
+    {
+      "type": "network_access_provider.v1",
+      "id": "tailscale",
+      "display_name": "Tailscale",
+      "network_access_provider": {
+        "provider": "tailscale",
+        "display_name": "Tailscale"
+      }
+    }
+  ],
+  "global_config_schema": [
+    {
+      "key": "tailscale",
+      "title": "Tailscale",
+      "description": "Enrollment settings shared by all hosts. Each host retains its own node identity.",
+      "json_schema": "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"hostname_prefix\":{\"type\":\"string\",\"pattern\":\"^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$\",\"default\":\"silo\"},\"auth_key\":{\"type\":\"string\",\"writeOnly\":true},\"tags\":{\"type\":\"string\",\"default\":\"\"},\"funnel\":{\"type\":\"boolean\",\"default\":false}}}",
+      "admin_form": {
+        "fields": [
+          {
+            "key": "hostname_prefix",
+            "label": "Hostname prefix",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "default_value": "silo",
+            "description": "Produces <prefix>-api and <prefix>-proxy-<node id>. Use a different prefix for each Silo deployment."
+          },
+          {
+            "key": "auth_key",
+            "label": "Auth key",
+            "control": "ADMIN_FORM_CONTROL_PASSWORD",
+            "secret": true,
+            "description": "Optional Tailscale auth key. Use a reusable key for multiple hosts; leave empty for interactive enrollment."
+          },
+          {
+            "key": "tags",
+            "label": "Tags",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "description": "Optional comma-separated tags, for example tag:silo. Tags must be authorized by your tailnet policy or auth key. Applies to the API host and all proxies."
+          },
+          {
+            "key": "funnel",
+            "label": "Funnel \u2014 public internet access",
+            "control": "ADMIN_FORM_CONTROL_SWITCH",
+            "default_value": false,
+            "description": "Advanced, off by default. Makes native Silo HTTPS on the API host and proxies reachable from the public internet. Requires Funnel authorization in your tailnet policy. Silo login still applies. Jellyfin and Audiobookshelf ports remain private."
+          }
+        ]
+      }
+    }
+  ]
 }

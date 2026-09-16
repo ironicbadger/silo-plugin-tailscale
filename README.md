@@ -19,7 +19,7 @@ and Python 3.13. Run from this repository:
 make check
 make audit
 make build
-make dist VERSION=0.1.0
+make dist VERSION=0.1.1
 ```
 
 `plugin` is the local executable. `dist/` contains Linux amd64, Linux arm64,
@@ -102,7 +102,7 @@ for the old node and its status reporter to finish.
 - Authorization URLs appear only in `awaiting_authorization` status. Provider
   logs contain fixed messages and state names; upstream errors, URLs, tokens and
   keys are excluded. Tailscale log uploads and local logtail buffers are disabled.
-- Funnel, identity-based Silo login, arbitrary upstream URLs, multiple API
+- Identity-based Silo login, arbitrary upstream URLs, multiple API
   replicas, and non-Tailscale providers are outside this plugin's scope.
 
 ## Tailscale storage adaptations
@@ -152,3 +152,13 @@ Before release, validate on the server branch with a real tailnet:
 Real-tailnet/server playback QA has not been performed by the automated tests.
 No Apple or Android API changes are needed: clients install Tailscale separately
 and use the provider's reported server URL.
+
+## HTTPS, tags, and public access
+
+The plugin automatically serves Silo over HTTPS using an embedded `tsnet` node. It does not require or configure a separate host `tailscaled` process or `tailscale serve` command. Enable MagicDNS and HTTPS certificates in the tailnet before connecting. A node can join the tailnet before its HTTPS certificate is ready. The plugin reports that distinction and retries certificate issuance with backoff from 15 seconds to five minutes, honoring a longer certificate-authority retry delay. It advertises a usable HTTPS origin only after certificate acquisition and listener setup succeed.
+
+Optional **Tags** accepts comma-separated Tailscale tags, such as `tag:silo,tag:media`. These tags apply to every plugin host and require authorization in the tailnet policy or authentication key. Changing tags may affect access under the tailnet policy.
+
+**Funnel — public internet access** is an advanced option and defaults to off. Enabling it exposes the native HTTPS listener on each host to the public internet as well as the tailnet. Silo authentication remains required. Tailscale must explicitly authorize Funnel for the node and port. Jellyfin and Audiobookshelf listeners remain tailnet-only. Turning Funnel off and saving the configuration replaces the resident process, closes existing listeners, and clears persisted Serve/Funnel configuration when the private listeners start. The default private mode never opens a public Funnel listener.
+
+Exit-node routing is not currently provided by this plugin. Its embedded network stack carries the plugin's connections, not the Silo process's general outbound traffic. An exit-node selector must not imply that metadata downloads or other Silo requests would use it. Use host-level Tailscale routing when that is the intended behavior.

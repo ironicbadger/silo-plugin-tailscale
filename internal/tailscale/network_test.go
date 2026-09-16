@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"strings"
@@ -56,6 +57,7 @@ type fakeOverlay struct {
 	failListenAt int
 	listeners    []net.Listener
 	ports        []string
+	public       []bool
 	closed       bool
 	watcher      *fakeWatcher
 }
@@ -92,14 +94,15 @@ func (n *fakeOverlay) Watch(ctx context.Context) (notificationWatcher, error) {
 	n.watcher.ctx = ctx
 	return n.watcher, n.watchError
 }
-func (n *fakeOverlay) Listen(network, address string) (net.Listener, error) {
+func (n *fakeOverlay) ListenTLS(_ context.Context, address string, _ *tls.Config, public bool) (net.Listener, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.ports = append(n.ports, address)
+	n.public = append(n.public, public)
 	if len(n.ports) == n.failListenAt {
 		return nil, errors.New("private listener error")
 	}
-	listener, err := net.Listen(network, "127.0.0.1:0")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err == nil {
 		n.listeners = append(n.listeners, listener)
 	}
@@ -135,6 +138,9 @@ type overlayRun struct {
 }
 
 func startFakeOverlay(t *testing.T, node *fakeOverlay, allListeners bool) *overlayRun {
+	return startConfiguredOverlay(t, node, allListeners, Config{})
+}
+func startConfiguredOverlay(t *testing.T, node *fakeOverlay, allListeners bool, config Config) *overlayRun {
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
 	run := &overlayRun{statuses: make(chan *pluginv1.NetworkAccessStatus, 32), done: make(chan struct{}), cancel: cancel}
@@ -147,7 +153,7 @@ func startFakeOverlay(t *testing.T, node *fakeOverlay, allListeners bool) *overl
 	}
 	go func() {
 		defer close(run.done)
-		run.err = runOverlay(ctx, listenerHost{h, info}, func(s *pluginv1.NetworkAccessStatus) {
+		run.err = runOverlay(ctx, listenerHost{h, info}, config, func(s *pluginv1.NetworkAccessStatus) {
 			select {
 			case run.statuses <- s:
 			case <-ctx.Done():
@@ -245,7 +251,7 @@ func TestOverlayEnrollmentFailureIsSafeAndCanRecover(t *testing.T) {
 }
 
 func TestOverlayFailureClosesPartialListeners(t *testing.T) {
-	for _, failure := range []string{"start", "watch", "certificate", "second-listener", "status", "watch-stream"} {
+	for _, failure := range []string{"start", "watch", "second-listener", "status", "watch-stream"} {
 		t.Run(failure, func(t *testing.T) {
 			node := newFakeOverlay()
 			node.current = runningStatus("silo.example.test")
@@ -255,8 +261,6 @@ func TestOverlayFailureClosesPartialListeners(t *testing.T) {
 				node.startError = secret
 			case "watch":
 				node.watchError = secret
-			case "certificate":
-				node.certificate = func(context.Context, string) ([]byte, []byte, error) { return nil, nil, secret }
 			case "second-listener":
 				node.failListenAt = 2
 			case "status":
@@ -338,5 +342,69 @@ func TestCertificateRejectsOtherNamesBeforeIssuance(t *testing.T) {
 		if _, err := getter(&tls.ClientHelloInfo{ServerName: name}); err == nil {
 			t.Fatalf("accepted SNI %q", name)
 		}
+	}
+}
+
+func TestCertificateErrorsDoNotExposePrivateDetails(t *testing.T) {
+	cases := []struct {
+		cause error
+		want  string
+	}{
+		{context.DeadlineExceeded, "timed out"},
+		{errors.New("429 rate limited secret-token"), "rate limited"},
+		{errors.New("SetDNS private-challenge secret-token"), "DNS challenge failed"},
+		{errors.New("cannot save encrypted overlay state secret-token"), "storage failed"},
+		{errors.New("acme.Register secret-token"), "registration failed"},
+		{errors.New("x509 secret-token"), "verification failed"},
+		{errors.New("private error secret-token"), "issuance failed"},
+	}
+	for _, test := range cases {
+		got := certificateError(test.cause).Error()
+		if !strings.Contains(got, test.want) || strings.Contains(got, "secret-token") {
+			t.Fatalf("unsafe or unhelpful error: %s", got)
+		}
+	}
+}
+
+func TestCertificateRetryKeepsIdentityWithoutAdvertisingOrigin(t *testing.T) {
+	node := newFakeOverlay()
+	attempts := 0
+	node.certificate = func(context.Context, string) ([]byte, []byte, error) {
+		attempts++
+		if attempts < 3 {
+			return nil, nil, errors.New("private challenge")
+		}
+		return []byte("cert"), []byte("key"), nil
+	}
+	var delays []time.Duration
+	ready := &pluginv1.NetworkAccessStatus{Hostname: "silo.example.test", Addresses: []string{"100.64.0.1"}, Origin: "https://silo.example.test"}
+	err := obtainCertificate(t.Context(), node, ready, func(s *pluginv1.NetworkAccessStatus) {
+		if s.State != "error" || s.Hostname != ready.Hostname || s.Origin != "" || len(s.Listeners) != 0 || strings.Contains(s.Error, "private") {
+			t.Fatalf("bad retry status: %v", s)
+		}
+	}, func(_ context.Context, d time.Duration) error { delays = append(delays, d); return nil })
+	if err != nil || attempts != 3 || len(delays) != 2 || delays[0] != 15*time.Second || delays[1] != 30*time.Second {
+		t.Fatalf("attempts=%d delays=%v err=%v", attempts, delays, err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := waitRetry(ctx, time.Hour); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+}
+
+func TestFunnelOnlyExposesNativeAPIWhenExplicitlyEnabled(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprint(enabled), func(t *testing.T) {
+			node := newFakeOverlay()
+			node.current = runningStatus("silo.example.test")
+			run := startConfiguredOverlay(t, node, true, Config{Funnel: enabled})
+			run.state(t, "connected")
+			node.mu.Lock()
+			defer node.mu.Unlock()
+			if len(node.public) != 3 || node.public[0] != enabled || node.public[1] || node.public[2] {
+				t.Fatalf("public listeners: %v", node.public)
+			}
+		})
 	}
 }

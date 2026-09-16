@@ -3,6 +3,7 @@ package tailscale
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -90,7 +91,7 @@ type overlay interface {
 	Close() error
 	Status(context.Context) (*ipnstate.Status, error)
 	CertPair(context.Context, string) ([]byte, []byte, error)
-	Listen(string, string) (net.Listener, error)
+	ListenTLS(context.Context, string, *tls.Config, bool) (net.Listener, error)
 	Watch(context.Context) (notificationWatcher, error)
 }
 
@@ -112,6 +113,22 @@ func (s *tsnetOverlay) Start() error {
 	s.client, err = s.LocalClient()
 	return err
 }
+
+func (s *tsnetOverlay) ListenTLS(ctx context.Context, address string, config *tls.Config, public bool) (net.Listener, error) {
+	// Clear stale Serve/Funnel configuration even when reopening privately.
+	if _, err := s.Server.Up(ctx); err != nil {
+		return nil, err
+	}
+	if !public {
+		listener, err := s.Server.Listen("tcp", address)
+		if err != nil {
+			return nil, err
+		}
+		return tls.NewListener(listener, config), nil
+	}
+	return s.Server.ListenFunnel("tcp", address, tsnet.FunnelTLSConfig(config))
+}
+
 func (s *tsnetOverlay) Status(ctx context.Context) (*ipnstate.Status, error) {
 	return s.client.StatusWithoutPeers(ctx)
 }
@@ -125,13 +142,13 @@ func (s *tsnetOverlay) Watch(ctx context.Context) (notificationWatcher, error) {
 func Run(ctx context.Context, host Host, config Config, publish func(*pluginv1.NetworkAccessStatus)) error {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	return runOverlay(ctx, host, publish, func(info *runtimehost.HostInfo) overlay {
+	return runOverlay(ctx, host, config, publish, func(info *runtimehost.HostInfo) overlay {
 		return &tsnetOverlay{Server: &tsnet.Server{Hostname: Hostname(config, info), Store: StateStore{host}, NoLocalState: true,
-			AuthKey: config.AuthKey, UserLogf: func(string, ...any) {}, Logf: func(string, ...any) {}}}
+			AuthKey: config.AuthKey, AdvertiseTags: config.Tags, UserLogf: func(string, ...any) {}, Logf: func(string, ...any) {}}}
 	}, ticker.C)
 }
 
-func runOverlay(ctx context.Context, host Host, publish func(*pluginv1.NetworkAccessStatus), newOverlay func(*runtimehost.HostInfo) overlay, ticks <-chan time.Time) error {
+func runOverlay(ctx context.Context, host Host, config Config, publish func(*pluginv1.NetworkAccessStatus), newOverlay func(*runtimehost.HostInfo) overlay, ticks <-chan time.Time) error {
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
 	call, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -222,19 +239,20 @@ func runOverlay(ctx context.Context, host Host, publish func(*pluginv1.NetworkAc
 				// Enrollment is complete; discard the auth URL while HTTPS
 				// issuance and listener setup are still in progress.
 				publish(&pluginv1.NetworkAccessStatus{State: "connecting", Hostname: s.Hostname, Addresses: s.Addresses})
-				call, cancel := context.WithTimeout(ctx, 2*time.Minute)
-				_, _, err := srv.CertPair(call, s.Hostname)
-				cancel()
-				if err != nil {
-					return &PublicError{"cannot obtain HTTPS certificate; check tailnet HTTPS settings and reconnect"}
+				if err := obtainCertificate(ctx, srv, s, publish, waitRetry); err != nil {
+					return err
 				}
 				for _, l := range info.Listeners {
-					ln, err := srv.Listen("tcp", fmt.Sprintf(":%d", listenerPort(l)))
+					tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: certificateFor(ctx, srv, s.Hostname)}
+					public := config.Funnel && l.Name == "api"
+					ln, err := srv.ListenTLS(ctx, fmt.Sprintf(":%d", listenerPort(l)), tlsConfig, public)
 					if err != nil {
+						if public {
+							return &PublicError{"cannot enable Funnel; authorize Funnel for this node in your tailnet policy and check that the API uses a supported HTTPS port"}
+						}
 						return &PublicError{"cannot open all overlay listeners; reconnect to retry"}
 					}
-					tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: certificateFor(ctx, srv, s.Hostname)}
-					servers = append(servers, serve(ctx, ln, tlsConfig, l.Address, info.IngressToken, failures))
+					servers = append(servers, serve(ctx, ln, nil, l.Address, info.IngressToken, failures))
 				}
 				lastHostname = s.Hostname
 			}
@@ -281,5 +299,74 @@ func certificateFor(ctx context.Context, node overlay, hostname string) func(*tl
 			return nil, &PublicError{"invalid HTTPS certificate"}
 		}
 		return &certificate, nil
+	}
+}
+
+// certificateError preserves actionable categories without exposing ACME
+// challenge values, account URLs, authentication URLs, or private keys.
+func certificateError(err error) error {
+	message := "HTTPS certificate issuance failed; check tailnet HTTPS settings"
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		message = "HTTPS certificate issuance timed out; check DNS and certificate authority connectivity"
+	default:
+		detail := strings.ToLower(err.Error())
+		switch {
+		case strings.Contains(detail, "rate limit"), strings.Contains(detail, "ratelimited"), strings.Contains(detail, "429"):
+			message = "HTTPS certificate issuance is rate limited; wait for the certificate authority retry window"
+		case strings.Contains(detail, "encrypted overlay state"):
+			message = "HTTPS certificate storage failed; check the plugin's encrypted instance storage"
+		case strings.Contains(detail, "no tailscalevarroot"):
+			message = "HTTPS certificate storage is unavailable; the custom state store was not selected"
+		case strings.Contains(detail, "setdns"):
+			message = "HTTPS certificate DNS challenge failed; check Tailscale control-plane connectivity and tailnet permissions"
+		case strings.Contains(detail, "acme.register"), strings.Contains(detail, "acme.getreg"):
+			message = "HTTPS certificate account registration failed; check certificate authority connectivity"
+		case strings.Contains(detail, "x509"):
+			message = "HTTPS certificate authority verification failed; check system time and trusted CA certificates"
+		case strings.Contains(detail, "order"), strings.Contains(detail, "authorization"):
+			message = "HTTPS certificate validation failed; check tailnet DNS and HTTPS configuration"
+		}
+	}
+	return &PublicError{message}
+}
+
+func waitRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// Enrollment can finish before DNS propagation or ACME issuance. Keep the
+// node alive and retry without advertising an HTTPS origin prematurely.
+func obtainCertificate(ctx context.Context, node overlay, ready *pluginv1.NetworkAccessStatus, publish func(*pluginv1.NetworkAccessStatus), wait func(context.Context, time.Duration) error) error {
+	delay := 15 * time.Second
+	for {
+		call, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		_, _, err := node.CertPair(call, ready.Hostname)
+		cancel()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err == nil {
+			return nil
+		}
+		retry := delay
+		if after, limited := local.RateLimitRetryAfter(err); limited && after > retry {
+			retry = after
+		}
+		publish(&pluginv1.NetworkAccessStatus{State: "error", Hostname: ready.Hostname, Addresses: ready.Addresses,
+			Error: fmt.Sprintf("%s. Joined tailnet; HTTPS is not ready. Retrying in %s.", certificateError(err).Error(), retry.Round(time.Second))})
+		if err := wait(ctx, retry); err != nil {
+			return err
+		}
+		if delay < 5*time.Minute {
+			delay = min(delay*2, 5*time.Minute)
+		}
 	}
 }

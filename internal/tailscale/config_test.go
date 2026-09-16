@@ -55,3 +55,34 @@ func TestAllListenersAndValidation(t *testing.T) {
 		t.Fatal("accepted colliding ports")
 	}
 }
+
+func TestTags(t *testing.T) {
+	for _, test := range []struct {
+		raw   string
+		valid bool
+		count int
+	}{
+		{"", true, 0}, {" tag:silo,tag:media,tag:silo ", true, 2}, {"silo", false, 0}, {"tag:", false, 0}, {"tag:silo,", false, 0},
+	} {
+		v, _ := structpb.NewStruct(map[string]any{"tags": test.raw})
+		got, err := ParseConfig([]*pluginv1.ConfigEntry{{Key: "tailscale", Value: v}})
+		if (err == nil) != test.valid || err == nil && len(got.Tags) != test.count {
+			t.Fatalf("tags %q: count=%d err=%v", test.raw, len(got.Tags), err)
+		}
+	}
+}
+
+func TestFunnelRequiresExplicitBoolean(t *testing.T) {
+	defaults, err := ParseConfig(nil)
+	if err != nil || defaults.Funnel {
+		t.Fatal("Funnel must default off")
+	}
+	for _, value := range []any{true, false, "true", 1} {
+		v, _ := structpb.NewStruct(map[string]any{"funnel": value})
+		c, err := ParseConfig([]*pluginv1.ConfigEntry{{Key: "tailscale", Value: v}})
+		b, valid := value.(bool)
+		if (err == nil) != valid || valid && c.Funnel != b {
+			t.Fatalf("funnel %v: %v", value, err)
+		}
+	}
+}

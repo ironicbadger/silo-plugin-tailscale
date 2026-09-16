@@ -147,7 +147,9 @@ func (p *Provider) start() {
 			if errors.As(err, &safe) {
 				message = safe.Message
 			}
-			publish(&pluginv1.NetworkAccessStatus{State: "error", Error: message})
+			last := p.snapshot()
+			publish(&pluginv1.NetworkAccessStatus{State: "error", Error: message,
+				Hostname: last.Hostname, Addresses: last.Addresses})
 		}
 	}()
 }

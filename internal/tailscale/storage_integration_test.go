@@ -2,10 +2,12 @@ package tailscale
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"tailscale.com/ipn"
 	"testing"
 	"time"
 
@@ -41,6 +43,13 @@ func TestTSNetStoresIdentityWithoutLocalFiles(t *testing.T) {
 		_ = s.Close()
 		t.Fatal(err)
 	}
+	lc, err := s.LocalClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lc.SetServeConfig(ctx, &ipn.ServeConfig{AllowFunnel: map[ipn.HostPort]bool{"silo.example.test:443": true}}); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +62,22 @@ func TestTSNetStoresIdentityWithoutLocalFiles(t *testing.T) {
 	// Reuse only the host-backed state. A fresh tsnet instance must reconnect
 	// as the same node without an enrollment key or any local state files.
 	restarted := newServer()
-	second, err := restarted.Up(ctx)
+	adapter := &tsnetOverlay{Server: restarted}
+	if err := adapter.Start(); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := adapter.ListenTLS(ctx, ":443", &tls.Config{MinVersion: tls.VersionTLS12}, false)
+	if err != nil {
+		_ = restarted.Close()
+		t.Fatal(err)
+	}
+	_ = listener.Close()
+	serveConfig, err := adapter.client.GetServeConfig(ctx)
+	if err != nil || serveConfig != nil && len(serveConfig.AllowFunnel) != 0 {
+		_ = restarted.Close()
+		t.Fatal("private restart retained Funnel configuration", err)
+	}
+	second, err := adapter.Status(ctx)
 	if err != nil {
 		_ = restarted.Close()
 		t.Fatal(err)
