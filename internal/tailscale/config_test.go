@@ -21,6 +21,10 @@ func TestConfigAndHostnames(t *testing.T) {
 		}
 	}
 	a := &runtimehost.HostInfo{HostRole: "api"}
+	c.HostnamePrefix = "my-silo"
+	if got := Hostname(c, a); got != "my-silo" {
+		t.Fatalf("hostname must match the configured value exactly: %q", got)
+	}
 	b := &runtimehost.HostInfo{HostRole: "proxy", NodeID: 1}
 	d := &runtimehost.HostInfo{HostRole: "proxy", NodeID: 2}
 	if Hostname(c, a) == Hostname(c, b) || Hostname(c, b) == Hostname(c, d) {

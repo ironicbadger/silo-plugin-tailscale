@@ -1,6 +1,6 @@
 {
   "plugin_id": "ironicbadger.network-access.tailscale",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "presentation": {
@@ -46,10 +46,10 @@
         "fields": [
           {
             "key": "hostname_prefix",
-            "label": "Hostname prefix",
+            "label": "Hostname",
             "control": "ADMIN_FORM_CONTROL_TEXT",
             "default_value": "silo",
-            "description": "Produces <prefix>-api and <prefix>-proxy-<node id>. Use a different prefix for each Silo deployment."
+            "description": "The API host uses this exact hostname. Proxy nodes use <hostname>-proxy-<node id> to keep each node distinct."
           },
           {
             "key": "auth_key",
@@ -69,7 +69,7 @@
             "label": "Funnel \u2014 public internet access",
             "control": "ADMIN_FORM_CONTROL_SWITCH",
             "default_value": false,
-            "description": "Advanced, off by default. Makes native Silo HTTPS on the API host and proxies reachable from the public internet. Requires Funnel authorization in your tailnet policy. Silo login still applies. Jellyfin and Audiobookshelf ports remain private."
+            "description": "CAUTION: Exposes Silo to the open public internet, you probably don't want to do this.\nThis feature requires Funnel authorization in your Tailscale account and ACL policy file.\nFunnel is not well suited to streaming video. Proceed at your own risk."
           }
         ]
       }

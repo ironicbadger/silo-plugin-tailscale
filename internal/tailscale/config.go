@@ -68,7 +68,7 @@ func ParseConfig(entries []*pluginv1.ConfigEntry) (Config, error) {
 		}
 	}
 	if !prefixPattern.MatchString(c.HostnamePrefix) {
-		return c, fmt.Errorf("hostname prefix must be 1–32 lowercase letters, digits or internal hyphens")
+		return c, fmt.Errorf("hostname must be 1–32 lowercase letters, digits or internal hyphens")
 	}
 	if c.AuthKey != "" && (!strings.HasPrefix(c.AuthKey, "tskey-auth-") || strings.ContainsAny(c.AuthKey, " \r\n\t")) {
 		return c, fmt.Errorf("auth key must be a Tailscale auth key")
@@ -80,5 +80,5 @@ func Hostname(c Config, info *runtimehost.HostInfo) string {
 	if info.HostRole == runtimehost.HostRoleProxy {
 		return fmt.Sprintf("%s-proxy-%d", c.HostnamePrefix, info.NodeID)
 	}
-	return c.HostnamePrefix + "-api"
+	return c.HostnamePrefix
 }

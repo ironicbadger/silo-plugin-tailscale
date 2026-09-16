@@ -19,7 +19,7 @@ and Python 3.13. Run from this repository:
 make check
 make audit
 make build
-make dist VERSION=0.1.2
+make dist VERSION=0.1.3
 ```
 
 `plugin` is the local executable. `dist/` contains Linux amd64, Linux arm64,
@@ -53,8 +53,8 @@ the storage adaptations described below. An unadapted build fails on the missing
    Certificate issuance puts the tailnet DNS name in public certificate
    transparency logs. Use non-sensitive hostnames.
 3. Extract the matching ZIP and upload its `plugin` executable through Silo's plugin installation flow. Then
-   enable the installation. Choose a hostname prefix; the default yields
-   `silo-api` and `silo-proxy-<node id>`. Use distinct prefixes for separate
+   enable the installation. Choose a hostname; the API host uses the value exactly as entered. The default yields
+   `silo` and `silo-proxy-<node id>`. Use distinct hostnames for separate
    deployments. Tailscale may disambiguate existing names; status reports the
    actual assigned DNS name.
 4. Optionally save a Tailscale auth key in the plugin's password field. For
