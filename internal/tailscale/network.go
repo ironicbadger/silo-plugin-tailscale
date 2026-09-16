@@ -293,6 +293,9 @@ func runOverlay(ctx context.Context, host Host, config Config, publish func(*plu
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-failures:
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return &PublicError{"overlay listener stopped; reconnect to retry"}
 		case notification := <-changes:
 			if notification.ErrMessage != nil {
@@ -303,6 +306,9 @@ func runOverlay(ctx context.Context, host Host, config Config, publish func(*plu
 				loginError = warning.Args[health.ArgError] != ""
 			}
 		case <-watchErrors:
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return &PublicError{"tsnet status monitoring stopped; reconnect to retry"}
 		case <-ticks:
 		}
