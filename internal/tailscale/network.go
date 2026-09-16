@@ -203,6 +203,16 @@ func runOverlay(ctx context.Context, host Host, config Config, publish func(*plu
 	}
 	defer closeServers()
 	lastHostname := ""
+	var retryTimer *time.Timer
+	var retryWake <-chan time.Time
+	retryDelay := 15 * time.Second
+	clearRetry := func() {
+		if retryTimer != nil {
+			retryTimer.Stop()
+		}
+		retryWake = nil
+	}
+	defer clearRetry()
 	for {
 		call, cancel := context.WithTimeout(ctx, 5*time.Second)
 		st, err := srv.Status(call)
@@ -214,6 +224,8 @@ func runOverlay(ctx context.Context, host Host, config Config, publish func(*plu
 			return &PublicError{"cannot read tsnet status; reconnect to retry"}
 		}
 		if st.BackendState != "Running" || len(st.TailscaleIPs) == 0 {
+			clearRetry()
+			retryDelay = 15 * time.Second
 			closeServers()
 			s := &pluginv1.NetworkAccessStatus{State: "connecting"}
 			if loginError {
@@ -236,12 +248,28 @@ func runOverlay(ctx context.Context, host Host, config Config, publish func(*plu
 				closeServers()
 			}
 			if len(servers) == 0 {
+				if retryWake != nil {
+					goto waitForChange
+				}
 				// Enrollment is complete; discard the auth URL while HTTPS
 				// issuance and listener setup are still in progress.
 				publish(&pluginv1.NetworkAccessStatus{State: "connecting", Hostname: s.Hostname, Addresses: s.Addresses})
-				if err := obtainCertificate(ctx, srv, s, publish, waitRetry); err != nil {
-					return err
+				call, cancel := context.WithTimeout(ctx, 2*time.Minute)
+				_, _, certErr := srv.CertPair(call, s.Hostname)
+				cancel()
+				if ctx.Err() != nil {
+					return ctx.Err()
 				}
+				if certErr != nil {
+					delay := certificateRetryDelay(certErr, retryDelay)
+					publish(&pluginv1.NetworkAccessStatus{State: "error", Hostname: s.Hostname, Addresses: s.Addresses,
+						Error: fmt.Sprintf("%s. Joined tailnet; HTTPS is not ready. Retrying in %s.", certificateError(certErr).Error(), delay.Round(time.Second))})
+					retryTimer = time.NewTimer(delay)
+					retryWake = retryTimer.C
+					retryDelay = min(retryDelay*2, 5*time.Minute)
+					goto waitForChange
+				}
+				retryDelay = 15 * time.Second
 				for _, l := range info.Listeners {
 					tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: certificateFor(ctx, srv, s.Hostname)}
 					public := config.Funnel && l.Name == "api"
@@ -258,7 +286,10 @@ func runOverlay(ctx context.Context, host Host, config Config, publish func(*plu
 			}
 			publish(s)
 		}
+	waitForChange:
 		select {
+		case <-retryWake:
+			retryWake = nil
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-failures:
@@ -331,42 +362,9 @@ func certificateError(err error) error {
 	return &PublicError{message}
 }
 
-func waitRetry(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
+func certificateRetryDelay(err error, backoff time.Duration) time.Duration {
+	if after, limited := local.RateLimitRetryAfter(err); limited && after > backoff {
+		return after
 	}
-}
-
-// Enrollment can finish before DNS propagation or ACME issuance. Keep the
-// node alive and retry without advertising an HTTPS origin prematurely.
-func obtainCertificate(ctx context.Context, node overlay, ready *pluginv1.NetworkAccessStatus, publish func(*pluginv1.NetworkAccessStatus), wait func(context.Context, time.Duration) error) error {
-	delay := 15 * time.Second
-	for {
-		call, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		_, _, err := node.CertPair(call, ready.Hostname)
-		cancel()
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err == nil {
-			return nil
-		}
-		retry := delay
-		if after, limited := local.RateLimitRetryAfter(err); limited && after > retry {
-			retry = after
-		}
-		publish(&pluginv1.NetworkAccessStatus{State: "error", Hostname: ready.Hostname, Addresses: ready.Addresses,
-			Error: fmt.Sprintf("%s. Joined tailnet; HTTPS is not ready. Retrying in %s.", certificateError(err).Error(), retry.Round(time.Second))})
-		if err := wait(ctx, retry); err != nil {
-			return err
-		}
-		if delay < 5*time.Minute {
-			delay = min(delay*2, 5*time.Minute)
-		}
-	}
+	return backoff
 }

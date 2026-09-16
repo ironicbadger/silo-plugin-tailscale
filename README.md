@@ -19,7 +19,7 @@ and Python 3.13. Run from this repository:
 make check
 make audit
 make build
-make dist VERSION=0.1.1
+make dist VERSION=0.1.2
 ```
 
 `plugin` is the local executable. `dist/` contains Linux amd64, Linux arm64,

@@ -366,30 +366,52 @@ func TestCertificateErrorsDoNotExposePrivateDetails(t *testing.T) {
 	}
 }
 
-func TestCertificateRetryKeepsIdentityWithoutAdvertisingOrigin(t *testing.T) {
+func TestCertificateRetryRemainsResponsiveToReauthorization(t *testing.T) {
 	node := newFakeOverlay()
+	node.current = runningStatus("silo.example.test")
+	node.certificate = func(context.Context, string) ([]byte, []byte, error) {
+		return nil, nil, errors.New("private challenge")
+	}
+	run := startFakeOverlay(t, node, false)
+	failed := run.state(t, "error")
+	if failed.Hostname != "silo.example.test" || failed.Origin != "" || strings.Contains(failed.Error, "private") {
+		t.Fatal(failed)
+	}
+	node.changeStatus(&ipnstate.Status{BackendState: "NeedsLogin", AuthURL: "https://login.example.test/reauth"})
+	run.state(t, "awaiting_authorization")
+	run.cancel()
+	if err := run.wait(t); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+}
+
+func TestCertificateAutomaticallyRecovers(t *testing.T) {
+	node := newFakeOverlay()
+	node.current = runningStatus("silo.example.test")
 	attempts := 0
 	node.certificate = func(context.Context, string) ([]byte, []byte, error) {
 		attempts++
-		if attempts < 3 {
-			return nil, nil, errors.New("private challenge")
+		if attempts == 1 {
+			return nil, nil, errors.New("transient failure")
 		}
 		return []byte("cert"), []byte("key"), nil
 	}
-	var delays []time.Duration
-	ready := &pluginv1.NetworkAccessStatus{Hostname: "silo.example.test", Addresses: []string{"100.64.0.1"}, Origin: "https://silo.example.test"}
-	err := obtainCertificate(t.Context(), node, ready, func(s *pluginv1.NetworkAccessStatus) {
-		if s.State != "error" || s.Hostname != ready.Hostname || s.Origin != "" || len(s.Listeners) != 0 || strings.Contains(s.Error, "private") {
-			t.Fatalf("bad retry status: %v", s)
+	run := startFakeOverlay(t, node, false)
+	run.state(t, "error")
+	deadline := time.NewTimer(20 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case s := <-run.statuses:
+			if s.State == "connected" {
+				if s.Origin != "https://silo.example.test" {
+					t.Fatal(s)
+				}
+				return
+			}
+		case <-deadline.C:
+			t.Fatal("certificate retry did not recover")
 		}
-	}, func(_ context.Context, d time.Duration) error { delays = append(delays, d); return nil })
-	if err != nil || attempts != 3 || len(delays) != 2 || delays[0] != 15*time.Second || delays[1] != 30*time.Second {
-		t.Fatalf("attempts=%d delays=%v err=%v", attempts, delays, err)
-	}
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	if err := waitRetry(ctx, time.Hour); !errors.Is(err, context.Canceled) {
-		t.Fatal(err)
 	}
 }
 
